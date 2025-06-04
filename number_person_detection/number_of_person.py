@@ -10,7 +10,7 @@ from openvino.runtime import Core
 import threading
 
 class PersonDetector:
-    def __init__(self, source, target_fps=30, width=640, height=480, ishow=True):
+    def __init__(self, source, target_fps=30, width=640, height=480, ishow=False):
         self.ie = Core()
         self.model = self.ie.read_model("number_person_detection/models/person-detection-retail-0013.xml")
         self.compiled_model = self.ie.compile_model(self.model, "CPU")
