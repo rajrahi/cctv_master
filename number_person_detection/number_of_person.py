@@ -9,15 +9,24 @@ from openvino.runtime import Core
 
 import threading
 
-class PersonDetector:
-    def __init__(self, source, target_fps=30, width=640, height=480, ishow=False):
-        self.ie = Core()
-        self.model = self.ie.read_model("number_person_detection/models/person-detection-retail-0013.xml")
-        self.compiled_model = self.ie.compile_model(self.model, "CPU")
-        self.input_layer = self.compiled_model.input(0)
+import cv2
+import torch
+import numpy as np
+import threading
+import psutil
+import GPUtil
+import logging
+from torchvision.models.detection import fasterrcnn_resnet50_fpn
+from torchvision.transforms import functional as F
 
-        self.vc = VideoConfig(source=source, target_fps=target_fps)
-        self.vc.set_resolution(width, height)
+class PersonDetector:
+    def __init__(self, source, target_fps=30, width=640, height=480, ishow=True, id=None):
+        self.id = id
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = fasterrcnn_resnet50_fpn(pretrained=True).to(self.device).eval()
+
+        self.cap = cv2.VideoCapture(source)
+        self.target_fps = target_fps
         self.width = width
         self.height = height
         self.ishow = ishow
@@ -25,6 +34,10 @@ class PersonDetector:
         self.paused = False
         self._stop = False
         self._lock = threading.Lock()
+
+        # Logger setup
+        logging.basicConfig(filename='system_metrics.log', level=logging.INFO, 
+                            format='%(asctime)s - %(message)s')
 
     def pause(self):
         with self._lock:
@@ -45,16 +58,7 @@ class PersonDetector:
 
     def detect(self):
         paused_frame = None
-        import psutil
-        import GPUtil
-        import logging
-
-        # Configure logging
-        logging.basicConfig(filename='system_metrics.log', level=logging.INFO, 
-                          format='%(asctime)s - %(message)s')
-
         while True:
-            # Log system metrics
             cpu_percent = psutil.cpu_percent()
             ram = psutil.virtual_memory()
             try:
@@ -64,39 +68,35 @@ class PersonDetector:
             except:
                 gpu_load = 0
                 gpu_memory = 0
-            
-            logging.info(f"CPU Usage: {cpu_percent}% | RAM Usage: {ram.percent}% | GPU Load: {gpu_load}% | GPU Memory: {gpu_memory}MB")
+            logging.info(f"instance:{self.id} | CPU Usage: {cpu_percent}% | RAM Usage: {ram.percent}% | GPU Load: {gpu_load}% | GPU Memory: {gpu_memory}MB")
 
             with self._lock:
                 if self._stop:
                     break
                 local_paused = self.paused
 
-            frame = self.vc.read_frame()
-            if frame is None:
+            ret, frame = self.cap.read()
+            if not ret:
                 break
 
-            if not self.vc.detect_motion(frame):
-                self.pause()
-            else:
-                self.resume()
+            frame = cv2.resize(frame, (self.width, self.height))
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image_tensor = F.to_tensor(rgb).unsqueeze(0).to(self.device)
 
             if not local_paused:
-                frame = cv2.resize(frame, (self.width, self.height))
-                resized = cv2.resize(frame, (544, 320))
-                input_image = np.expand_dims(resized.transpose(2, 0, 1), 0)
+                with torch.no_grad():
+                    predictions = self.model(image_tensor)
 
-                output = self.compiled_model([input_image])[self.compiled_model.output(0)]
+                boxes = predictions[0]['boxes']
+                labels = predictions[0]['labels']
+                scores = predictions[0]['scores']
 
                 person_count = 0
-                for det in output[0][0]:
-                    _, label, conf, x_min, y_min, x_max, y_max = det
-                    if conf > 0.5:
+                for box, label, score in zip(boxes, labels, scores):
+                    if label == 1 and score > 0.5:  # person label in COCO
                         person_count += 1
-                        cv2.rectangle(frame, 
-                                    (int(x_min * frame.shape[1]), int(y_min * frame.shape[0])),
-                                    (int(x_max * frame.shape[1]), int(y_max * frame.shape[0])),
-                                    (0, 255, 0), 2)
+                        x1, y1, x2, y2 = box.int().tolist()
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
                 print(f"Number of persons detected: {person_count}")
                 paused_frame = frame.copy()
@@ -105,11 +105,12 @@ class PersonDetector:
 
             if self.ishow and frame is not None:
                 cv2.imshow("Person Detection", frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
-                    break        
-        self.vc.cap.release()
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+        self.cap.release()
         cv2.destroyAllWindows()
+
 
 
 # detector = PersonDetector(source="rtsp://admin:tech@9900@106.51.129.154:554/Streaming/Channels/201")
